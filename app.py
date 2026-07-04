@@ -1,6 +1,7 @@
 import json
 import math
 import re
+from io import BytesIO
 
 from openai import OpenAI
 
@@ -13,6 +14,7 @@ st.set_page_config(page_title="AI Master Planning Optimization Agent", layout="w
 SAVED_INPUTS_FILE = Path(__file__).parent / "saved_inputs.json"
 INPUT_CELLS = {
     "cost_luxury": "B5", "cost_semi": "B6", "cost_apartment": "B7", "cost_mixed": "B8",
+    "marketing_cost_pct": "B9", "soft_cost_pct": "B10",
     "price_luxury": "B11", "price_semi": "B12", "price_apartment": "B13", "price_mixed": "B14",
     "cashflow_luxury": "B17", "cashflow_semi": "B18", "cashflow_apartment": "B19", "cashflow_mixed": "B20",
     "prob_luxury": "B30", "prob_semi": "B31", "prob_apartment": "B32", "prob_mixed": "B33",
@@ -55,6 +57,8 @@ DEFAULT_INPUTS = {
     "cost_semi": 350.0,
     "cost_apartment": 550.0,
     "cost_mixed": 800.0,
+    "marketing_cost_pct": 0.0,
+    "soft_cost_pct": 0.0,
     "price_luxury": 925.0,
     "price_semi": 850.0,
     "price_apartment": 900.0,
@@ -162,6 +166,12 @@ def run_python_model(data):
         - d["green_pct"]
         - d["micromobility_pct"]
     )
+
+    cost_uplift_factor = 1 + safe_number(d["marketing_cost_pct"]) / 100 + safe_number(d["soft_cost_pct"]) / 100
+    effective_cost_luxury = d["cost_luxury"] * cost_uplift_factor
+    effective_cost_semi = d["cost_semi"] * cost_uplift_factor
+    effective_cost_apartment = d["cost_apartment"] * cost_uplift_factor
+    effective_cost_mixed = d["cost_mixed"] * cost_uplift_factor
 
     profit_luxury_score_base = safe_div(d["price_luxury"] - d["cost_luxury"], d["price_luxury"])
     profit_semi_score_base = safe_div(d["price_semi"] - d["cost_semi"], d["price_semi"])
@@ -285,11 +295,12 @@ def run_python_model(data):
     builtup_mixed = mixed_total_builtup
     builtup_total = builtup_luxury + builtup_semi + builtup_apartments + builtup_mixed
 
-    capex_luxury = gfa_luxury * d["cost_luxury"]
-    capex_semi = gfa_semi * d["cost_semi"]
-    capex_apartments = gfa_apartments * d["cost_apartment"]
-    capex_mixed = gfa_mixed * d["cost_mixed"]
-    capex_total = capex_luxury + capex_semi + capex_apartments + capex_mixed + gfa_total * (90 + 60)
+    capex_luxury = gfa_luxury * effective_cost_luxury
+    capex_semi = gfa_semi * effective_cost_semi
+    capex_apartments = gfa_apartments * effective_cost_apartment
+    capex_mixed = gfa_mixed * effective_cost_mixed
+    infrastructure_cost = gfa_total * (90 + 60) * cost_uplift_factor
+    capex_total = capex_luxury + capex_semi + capex_apartments + capex_mixed + infrastructure_cost
 
     revenue_luxury = gfa_luxury * d["price_luxury"]
     revenue_semi = gfa_semi * d["price_semi"]
@@ -420,6 +431,32 @@ def fmt(value, unit=""):
     return f"{value:,.0f}{unit}"
 
 
+def get_optional_secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return ""
+
+
+def require_password():
+    app_password = str(get_optional_secret("APP_PASSWORD") or "").strip()
+    if not app_password or st.session_state.get("authenticated", False):
+        return
+
+    st.title("AI Master Planning Optimization Agent")
+    st.caption("Enter the access password to continue.")
+    entered_password = st.text_input("Password", type="password")
+
+    if st.button("Enter", type="primary"):
+        if entered_password == app_password:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()
+
+
 def nav_button(label, page_name):
     active = st.session_state.page == page_name
 
@@ -469,6 +506,15 @@ if "defaults_loaded" not in st.session_state:
 
 if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
+
+if "defaults" not in st.session_state:
+    st.session_state.defaults = load_default_inputs()
+
+for key, value in DEFAULT_INPUTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+    if key not in st.session_state.defaults:
+        st.session_state.defaults[key] = value
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -563,6 +609,8 @@ h2, h3 {
 }
 </style>
 """, unsafe_allow_html=True)
+
+require_password()
 
 st.sidebar.title("Project Workspace")
 st.sidebar.caption("INPUTS")
@@ -815,15 +863,11 @@ Return only valid JSON in this exact format:
     return normalize_ai_weights(ai_result)
 
 
-def save_results_to_excel(result):
+def build_results_excel(result):
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%Y.%m.%d - %H.%M")
-
-    results_folder = Path(__file__).parent / "Results"
-    results_folder.mkdir(exist_ok=True)
-
-    export_file = results_folder / f"{timestamp} - CMP Optimization results.xlsx"
+    export_filename = f"{timestamp} - CMP Optimization results.xlsx"
 
     input_rows = [
 
@@ -838,6 +882,8 @@ def save_results_to_excel(result):
         "cost_semi": ("Financial", "Semi-detached Villas Construction Cost"),
         "cost_apartment": ("Financial", "Apartments Construction Cost"),
         "cost_mixed": ("Financial", "Business Center Construction Cost"),
+        "marketing_cost_pct": ("Financial", "Marketing Costs"),
+        "soft_cost_pct": ("Financial", "Soft Costs"),
 
         "price_luxury": ("Financial", "Luxury Villas Selling Price"),
         "price_semi": ("Financial", "Semi-detached Villas Selling Price"),
@@ -1095,7 +1141,8 @@ def save_results_to_excel(result):
         ],
     })
 
-    with pd.ExcelWriter(export_file, engine="openpyxl") as writer:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         inputs_df.to_excel(writer, sheet_name="Project Inputs", index=False)
 
         executive_summary.to_excel(writer, sheet_name="Executive Summary", index=False)
@@ -1105,7 +1152,7 @@ def save_results_to_excel(result):
         apartments_details.to_excel(writer, sheet_name="Apartments", index=False)
         mixed_details.to_excel(writer, sheet_name="Business Center", index=False)
 
-    return export_file
+    return export_filename, output.getvalue()
 
 
 
@@ -1261,6 +1308,28 @@ with main_content:
     elif page == "Financial":
         st.subheader("Financial Inputs")
 
+        overhead_cols = st.columns(2)
+        with overhead_cols[0]:
+            st.session_state.marketing_cost_pct = st.number_input(
+                "Marketing Costs (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.marketing_cost_pct),
+                step=0.5,
+                key="input_marketing_cost_pct",
+            )
+        with overhead_cols[1]:
+            st.session_state.soft_cost_pct = st.number_input(
+                "Soft Costs (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.soft_cost_pct),
+                step=0.5,
+                key="input_soft_cost_pct",
+            )
+
+        st.divider()
+
         cols = st.columns(4)
         typologies = [
             ("Luxury Villas", "luxury"),
@@ -1289,11 +1358,15 @@ with main_content:
                     key=f"input_cashflow_{key}",
                 )
                 prob_key = "prob_apartment" if key == "apartment" else f"prob_{key}"
-                st.session_state[prob_key] = st.number_input(
-                    "Sale Probability",
-                    value=safe_number(st.session_state[prob_key]),
+                probability_percent = st.number_input(
+                    "Sale Probability (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=safe_number(st.session_state[prob_key]) * 100,
+                    step=1.0,
                     key=f"input_prob_{key}",
                 )
+                st.session_state[prob_key] = probability_percent / 100
 
 
 
@@ -1309,32 +1382,48 @@ with main_content:
         c1, c2, c3, c4 = st.columns(4)
 
         with c1:
-            st.session_state.road_pct = st.number_input(
+            road_pct_percent = st.number_input(
                 "Roads (%)",
-                value=safe_number(st.session_state.road_pct),
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.road_pct) * 100,
+                step=1.0,
                 key="design_road_pct",
             )
+            st.session_state.road_pct = road_pct_percent / 100
 
         with c2:
-            st.session_state.walkway_pct = st.number_input(
+            walkway_pct_percent = st.number_input(
                 "Walkways (%)",
-                value=safe_number(st.session_state.walkway_pct),
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.walkway_pct) * 100,
+                step=1.0,
                 key="design_walkway_pct",
             )
+            st.session_state.walkway_pct = walkway_pct_percent / 100
 
         with c3:
-            st.session_state.green_pct = st.number_input(
+            green_pct_percent = st.number_input(
                 "Public Realm (%)",
-                value=safe_number(st.session_state.green_pct),
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.green_pct) * 100,
+                step=1.0,
                 key="design_green_pct",
             )
+            st.session_state.green_pct = green_pct_percent / 100
 
         with c4:
-            st.session_state.micromobility_pct = st.number_input(
+            micromobility_pct_percent = st.number_input(
                 "Micromobility (%)",
-                value=safe_number(st.session_state.micromobility_pct),
+                min_value=0.0,
+                max_value=100.0,
+                value=safe_number(st.session_state.micromobility_pct) * 100,
+                step=1.0,
                 key="design_micromobility_pct",
             )
+            st.session_state.micromobility_pct = micromobility_pct_percent / 100
 
         st.divider()
 
@@ -1469,9 +1558,17 @@ with main_content:
 
 
 
-            if st.button("💾 Save Results", use_container_width=True):
-                export_file = save_results_to_excel(result)
-                st.success(f"Results saved to:\n{export_file}")
+            try:
+                export_filename, export_data = build_results_excel(result)
+                st.download_button(
+                    "💾 Save Results",
+                    data=export_data,
+                    file_name=export_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as error:
+                st.error(f"Could not prepare the results file: {error}")
 
         
 
