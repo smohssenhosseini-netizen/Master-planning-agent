@@ -1,10 +1,12 @@
 import json
 import math
 import re
+import html
 from io import BytesIO
 
 from openai import OpenAI
 
+import altair as alt
 import streamlit as st
 import pandas as pd
 from pathlib import Path
@@ -48,6 +50,16 @@ INPUT_CELLS = {
     "mixed_pct_3bhk": "E78",
     "mixed_pct_4bhk": "E79",
     "mixed_visitor_parking_pct": "B78",
+    "construction_pace_luxury": "G5",
+    "construction_pace_semi": "G6",
+    "construction_pace_apartment": "G7",
+    "construction_pace_mixed": "G8",
+    "construction_pace_infrastructure": "G9",
+    "absorption_luxury_per_month": "G11",
+    "absorption_semi_per_month": "G12",
+    "absorption_apartment_per_month": "G13",
+    "absorption_commercial_per_month": "G14",
+    "absorption_office_per_month": "G15",
 }
 
 CASHFLOW_OPTIONS = ["Late", "Slow", "Normal", "Semi-Fast", "Fast"]
@@ -119,6 +131,16 @@ DEFAULT_INPUTS = {
     "mixed_pct_3bhk": 0.60,
     "mixed_pct_4bhk": 0.40,
     "mixed_visitor_parking_pct": 1.0,
+    "construction_pace_luxury": 100.0,
+    "construction_pace_semi": 100.0,
+    "construction_pace_apartment": 130.0,
+    "construction_pace_mixed": 130.0,
+    "construction_pace_infrastructure": 1000.0,
+    "absorption_luxury_per_month": 1.0,
+    "absorption_semi_per_month": 2.0,
+    "absorption_apartment_per_month": 12.0,
+    "absorption_commercial_per_month": 3.0,
+    "absorption_office_per_month": 2.0,
 }
 
 
@@ -154,6 +176,149 @@ def cashflow_score(value):
         "Semi-Fast": 4.0,
         "Fast": 5.0,
     }.get(value, 3.0)
+
+
+def cashflow_start_factor(value):
+    return {
+        "Fast": 0.10,
+        "Semi-Fast": 0.20,
+        "Normal": 0.35,
+        "Slow": 0.55,
+        "Late": 1.00,
+    }.get(value, 0.35)
+
+
+def build_monthly_cashflow(d, result_values):
+    components = [
+        {
+            "name": "Luxury Villas",
+            "start_month": 1,
+            "capex": result_values["capex_luxury"],
+            "revenue": result_values["revenue_luxury"],
+            "units": result_values["luxury_units"],
+            "construction_workload": result_values["builtup_luxury"],
+            "construction_pace": d["construction_pace_luxury"],
+            "absorption_per_month": d["absorption_luxury_per_month"],
+            "cashflow": d["cashflow_luxury"],
+        },
+        {
+            "name": "Semi-detached Villas",
+            "start_month": 1,
+            "capex": result_values["capex_semi"],
+            "revenue": result_values["revenue_semi"],
+            "units": result_values["semi_units"],
+            "construction_workload": result_values["builtup_semi"],
+            "construction_pace": d["construction_pace_semi"],
+            "absorption_per_month": d["absorption_semi_per_month"],
+            "cashflow": d["cashflow_semi"],
+        },
+        {
+            "name": "Apartments",
+            "start_month": 4,
+            "capex": result_values["capex_apartments"],
+            "revenue": result_values["revenue_apartments"],
+            "units": result_values["apartments_total_units"],
+            "construction_workload": result_values["builtup_apartments"],
+            "construction_pace": d["construction_pace_apartment"],
+            "absorption_per_month": d["absorption_apartment_per_month"],
+            "cashflow": d["cashflow_apartment"],
+        },
+        {
+            "name": "Business Center",
+            "start_month": 10,
+            "capex": result_values["capex_mixed"],
+            "revenue": result_values["revenue_mixed"],
+            "units": result_values["mixed_commercial_units"] + result_values["mixed_Office_units"],
+            "construction_workload": result_values["builtup_mixed"],
+            "construction_pace": d["construction_pace_mixed"],
+            "absorption_per_month": d["absorption_commercial_per_month"] + d["absorption_office_per_month"],
+            "cashflow": d["cashflow_mixed"],
+        },
+        {
+            "name": "Infrastructure",
+            "start_month": 1,
+            "capex": result_values["infrastructure_cost"],
+            "revenue": 0,
+            "units": 0,
+            "construction_workload": result_values["gfa_total"],
+            "construction_pace": d["construction_pace_infrastructure"],
+            "absorption_per_month": 0,
+            "cashflow": "Normal",
+        },
+    ]
+
+    planned = []
+    for component in components:
+        construction_months = max(
+            1,
+            int(math.ceil(safe_div(component["construction_workload"], component["construction_pace"], 1))),
+        )
+        absorption_months = 0
+        if component["revenue"] > 0 and component["units"] > 0:
+            absorption_months = max(
+                1,
+                int(math.ceil(safe_div(component["units"], component["absorption_per_month"], 1))),
+            )
+        duration_months = max(construction_months, absorption_months or 0)
+        construction_start = component["start_month"]
+        construction_end = construction_start + duration_months - 1
+        revenue_start = construction_start + int(math.floor(duration_months * cashflow_start_factor(component["cashflow"])))
+        revenue_end = revenue_start + absorption_months - 1 if absorption_months else 0
+        planned.append(
+            {
+                **component,
+                "construction_months": construction_months,
+                "absorption_months": absorption_months,
+                "duration_months": duration_months,
+                "construction_start": construction_start,
+                "construction_end": construction_end,
+                "revenue_start": revenue_start,
+                "revenue_end": revenue_end,
+            }
+        )
+
+    construction_completion = max(component["construction_end"] for component in planned if component["capex"] > 0)
+    revenue_completion = max([component["revenue_end"] for component in planned if component["revenue_end"] > 0] or [0])
+    estimated_completion = max(construction_completion, revenue_completion)
+    typology_durations = {
+        component["name"]: component["duration_months"]
+        for component in planned
+        if component["capex"] > 0
+    }
+
+    monthly = []
+    cumulative_net = 0
+    peak_funding_gap = 0
+    for month in range(1, estimated_completion + 1):
+        cost_outflow = 0
+        revenue_inflow = 0
+        for component in planned:
+            if component["capex"] > 0 and component["construction_start"] <= month <= component["construction_end"]:
+                cost_outflow += safe_div(component["capex"], component["duration_months"])
+            if component["revenue"] > 0 and component["revenue_start"] <= month <= component["revenue_end"]:
+                revenue_inflow += safe_div(component["revenue"], component["absorption_months"])
+        net_cashflow = revenue_inflow - cost_outflow
+        cumulative_net += net_cashflow
+        peak_funding_gap = min(peak_funding_gap, cumulative_net)
+        monthly.append(
+            {
+                "Month": month,
+                "Construction Cost": cost_outflow,
+                "Revenue": revenue_inflow,
+                "Net Cashflow": net_cashflow,
+                "Cumulative Cashflow": cumulative_net,
+            }
+        )
+
+    return {
+        "construction_completion_months": construction_completion,
+        "revenue_completion_months": revenue_completion,
+        "estimated_completion_months": estimated_completion,
+        "total_duration_months": estimated_completion,
+        "typology_durations": typology_durations,
+        "peak_funding_gap": abs(peak_funding_gap),
+        "cashflow_monthly": monthly,
+    }
 
 
 def run_python_model(data):
@@ -314,6 +479,31 @@ def run_python_model(data):
     profit_mixed = safe_div(revenue_mixed - capex_mixed, revenue_mixed)
     profit_general = safe_div(revenue_total - capex_total, revenue_total)
 
+    delivery_cashflow = build_monthly_cashflow(
+        d,
+        {
+            "capex_luxury": capex_luxury,
+            "capex_semi": capex_semi,
+            "capex_apartments": capex_apartments,
+            "capex_mixed": capex_mixed,
+            "infrastructure_cost": infrastructure_cost,
+            "revenue_luxury": revenue_luxury,
+            "revenue_semi": revenue_semi,
+            "revenue_apartments": revenue_apartments,
+            "revenue_mixed": revenue_mixed,
+            "luxury_units": luxury_units,
+            "semi_units": semi_units,
+            "apartments_total_units": apartments_total_units,
+            "mixed_commercial_units": mixed_commercial_units,
+            "mixed_Office_units": mixed_Office_units,
+            "builtup_luxury": builtup_luxury,
+            "builtup_semi": builtup_semi,
+            "builtup_apartments": builtup_apartments,
+            "builtup_mixed": builtup_mixed,
+            "gfa_total": gfa_total,
+        },
+    )
+
     return {
         "sellable_land_use_area": sellable_land_use_area,
         "gfa_luxury": gfa_luxury,
@@ -369,6 +559,7 @@ def run_python_model(data):
         "capex_semi": capex_semi,
         "capex_apartments": capex_apartments,
         "capex_mixed": capex_mixed,
+        "infrastructure_cost": infrastructure_cost,
         "capex_total": capex_total,
         "revenue_luxury": revenue_luxury,
         "revenue_semi": revenue_semi,
@@ -380,6 +571,7 @@ def run_python_model(data):
         "profit_apartments": profit_apartments,
         "profit_mixed": profit_mixed,
         "profit_general": profit_general,
+        **delivery_cashflow,
     }
 
 
@@ -519,6 +711,12 @@ for key, value in DEFAULT_INPUTS.items():
 if "result" not in st.session_state:
     st.session_state.result = None
 
+if "scenarios" not in st.session_state:
+    st.session_state.scenarios = []
+
+if "scenario_ai_review" not in st.session_state:
+    st.session_state.scenario_ai_review = ""
+
 
 
 st.markdown("""
@@ -535,11 +733,30 @@ h2, h3 {
 }
 
 [data-testid="stMetricValue"] {
-    font-size: 1.75rem !important;
+    font-size: 1.35rem !important;
+    font-weight: 700 !important;
+    line-height: 1.25 !important;
 }
 
 [data-testid="stMetricLabel"] {
     font-size: 0.82rem !important;
+    color: rgba(49, 51, 63, 0.72) !important;
+}
+
+.delivery-input-label {
+    min-height: 4.25rem;
+    font-size: 1rem;
+    line-height: 1.35;
+    font-weight: 500;
+    color: var(--text-color);
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    margin-bottom: 0.35rem;
+}
+
+.delivery-input-label span {
+    font-weight: 400;
 }
 
 [data-testid="stHeader"] {
@@ -563,7 +780,7 @@ h2, h3 {
 }
 
 .advisor-divider {
-    margin: 12px 0;
+    margin: 4px 0;
     border: 0;
     border-top: 1px solid rgba(128, 128, 128, 0.25);
 }
@@ -571,33 +788,45 @@ h2, h3 {
 .advisor-section-title {
     font-size: 16px;
     font-weight: 800;
-    margin: 8px 0 8px;
+    margin: 4px 0 4px;
 }
 
 .advisor-metric {
-    margin: 8px 0 12px;
+    margin: 0;
+    padding: 2px 0 3px;
 }
 
 .advisor-metric-label {
     font-size: 12px;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
 }
 
 .advisor-metric-value {
-    font-size: 24px;
-    font-weight: 500;
+    font-size: 18px;
+    font-weight: 700;
     line-height: 1.15;
 }
 
 .advisor-caption {
     font-size: 12px;
-    line-height: 1.25;
-    margin-top: 6px;
+    line-height: 1.12;
+    margin-top: 2px;
 }
 
 .advisor-program-list {
     font-size: 12px;
-    line-height: 1.55;
+    line-height: 1.25;
+}
+
+div[data-testid="stMarkdownContainer"] > .advisor-metric,
+div[data-testid="stMarkdownContainer"] > .advisor-section-title {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+
+div[data-testid="stMarkdownContainer"] hr.advisor-divider {
+    margin-top: 5px !important;
+    margin-bottom: 5px !important;
 }
 
 .typology-column-title {
@@ -606,6 +835,44 @@ h2, h3 {
     line-height: 1.15;
     margin: 0 0 1rem 0;
     white-space: nowrap;
+}
+
+.comparison-card {
+    border: 1px solid rgba(128, 128, 128, 0.24);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 8px 0 12px;
+    background: rgba(128, 128, 128, 0.04);
+}
+
+.comparison-card-title {
+    font-size: 15px;
+    font-weight: 800;
+    margin-bottom: 8px;
+}
+
+.comparison-card-value {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.1;
+}
+
+.ai-review-panel {
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    border-left: 4px solid #60a5fa;
+    border-radius: 12px;
+    padding: 16px 18px;
+    background: rgba(96, 165, 250, 0.08);
+    line-height: 1.55;
+}
+
+.ai-recommendation-panel {
+    border: 1px solid rgba(34, 197, 94, 0.35);
+    border-left: 4px solid #22c55e;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-top: 16px;
+    background: rgba(34, 197, 94, 0.08);
 }
 </style>
 """, unsafe_allow_html=True)
@@ -630,6 +897,7 @@ if st.sidebar.button("⚡ Run Optimization", use_container_width=True, type="pri
     st.rerun()
 
 nav_button("Optimization Results", "Results")
+nav_button("Scenario Comparison", "Comparison")
 
 st.sidebar.divider()
 
@@ -972,6 +1240,8 @@ def build_results_excel(result):
             "Investment Required",
             "Expected Revenue",
             "Expected Profit Margin",
+            "Total Duration",
+            "Peak Funding Gap",
             "Sellable Land Use Percentage",
             "Total GFA",
             "Total Built-up Area",
@@ -980,6 +1250,8 @@ def build_results_excel(result):
             result["capex_total"],
             result["revenue_total"],
             result["profit_general"],
+            result["total_duration_months"],
+            result["peak_funding_gap"],
             result["sellable_land_use_area"],
             result["gfa_total"],
             result["builtup_total"],
@@ -1141,6 +1413,8 @@ def build_results_excel(result):
         ],
     })
 
+    cashflow_df = cashflow_dataframe(result)
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         inputs_df.to_excel(writer, sheet_name="Project Inputs", index=False)
@@ -1151,8 +1425,400 @@ def build_results_excel(result):
         semi_details.to_excel(writer, sheet_name="Semi Villas", index=False)
         apartments_details.to_excel(writer, sheet_name="Apartments", index=False)
         mixed_details.to_excel(writer, sheet_name="Business Center", index=False)
+        cashflow_df.to_excel(writer, sheet_name="Monthly Cashflow", index=False)
 
     return export_filename, output.getvalue()
+
+
+def create_scenario_snapshot(name):
+    from datetime import datetime
+
+    result = dict(st.session_state.result or {})
+    inputs = collect_data()
+    strategy = {
+        "Investment Strategy": st.session_state.get("ai_investment_strategy", ""),
+        "Definition of Success": st.session_state.get("ai_success_definition", ""),
+        "Main Concerns": st.session_state.get("ai_main_concerns", ""),
+        "Profitability Weight": st.session_state.get("profit_weight", 0),
+        "Cashflow Weight": st.session_state.get("cashflow_weight", 0),
+        "Sale Probability Weight": st.session_state.get("prob_weight", 0),
+    }
+
+    return {
+        "name": name.strip(),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "inputs": inputs,
+        "strategy": strategy,
+        "result": result,
+    }
+
+
+def scenario_comparison_rows(scenarios):
+    rows = []
+    for scenario in scenarios:
+        result = scenario["result"]
+        inputs = scenario["inputs"]
+        rows.append(
+            {
+                "Scenario": scenario["name"],
+                "Investment (M OMR)": result.get("capex_total", 0) / 1_000_000,
+                "Revenue (M OMR)": result.get("revenue_total", 0) / 1_000_000,
+                "Profit Margin": result.get("profit_general", 0),
+                "Total Duration (months)": result.get("total_duration_months", result.get("estimated_completion_months", 0)),
+                "Peak Funding Gap (M OMR)": result.get("peak_funding_gap", 0) / 1_000_000,
+                "Sellable Land Use": result.get("sellable_land_use_area", 0),
+                "GFA (k sqm)": result.get("gfa_total", 0) / 1000,
+                "BUA (k sqm)": result.get("builtup_total", 0) / 1000,
+                "Luxury Villas": result.get("luxury_units", 0),
+                "Semi Villas": result.get("semi_units", 0),
+                "Apartment Buildings": result.get("apartments_buildings", 0),
+                "Apartment Units": result.get("apartments_total_units", 0),
+                "Commercial Units": result.get("mixed_commercial_units", 0),
+                "Office Units": result.get("mixed_Office_units", 0),
+                "Apartment Parking Stories": inputs.get("apt_parking_stories", 0),
+                "Business Parking Stories": inputs.get("mixed_parking_stories", 0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_scenario_comparison_excel(scenarios, ai_review=""):
+    from datetime import datetime
+
+    output = BytesIO()
+    comparison_df = scenario_comparison_rows(scenarios)
+
+    detail_rows = []
+    for scenario in scenarios:
+        result = scenario["result"]
+        inputs = scenario["inputs"]
+        strategy = scenario["strategy"]
+        detail_rows.extend(
+            [
+                (scenario["name"], "Saved At", scenario["created_at"]),
+                (scenario["name"], "Investment Strategy", strategy.get("Investment Strategy", "")),
+                (scenario["name"], "Definition of Success", strategy.get("Definition of Success", "")),
+                (scenario["name"], "Main Concerns", strategy.get("Main Concerns", "")),
+                (scenario["name"], "Profitability Weight", strategy.get("Profitability Weight", "")),
+                (scenario["name"], "Cashflow Weight", strategy.get("Cashflow Weight", "")),
+                (scenario["name"], "Sale Probability Weight", strategy.get("Sale Probability Weight", "")),
+                (scenario["name"], "Luxury Allocation", result.get("allocation_luxury", 0)),
+                (scenario["name"], "Semi-detached Allocation", result.get("allocation_semi", 0)),
+                (scenario["name"], "Apartments Allocation", result.get("allocation_apartments", 0)),
+                (scenario["name"], "Business Center Allocation", result.get("allocation_mixed", 0)),
+                (scenario["name"], "Total Duration Months", result.get("total_duration_months", result.get("estimated_completion_months", 0))),
+                (scenario["name"], "Peak Funding Gap", result.get("peak_funding_gap", 0)),
+                (scenario["name"], "Apartment Parking Stories", inputs.get("apt_parking_stories", 0)),
+                (scenario["name"], "Business Center Parking Stories", inputs.get("mixed_parking_stories", 0)),
+                (scenario["name"], "Apartment 1-BHK Mix", inputs.get("apt_pct_1bhk", 0)),
+                (scenario["name"], "Apartment 2-BHK Mix", inputs.get("apt_pct_2bhk", 0)),
+                (scenario["name"], "Apartment 3-BHK Mix", inputs.get("apt_pct_3bhk", 0)),
+                (scenario["name"], "Apartment 4-BHK Mix", inputs.get("apt_pct_4bhk", 0)),
+            ]
+        )
+
+    details_df = pd.DataFrame(detail_rows, columns=["Scenario", "Item", "Value"])
+    review_df = pd.DataFrame({"AI Scenario Review": [ai_review]}) if ai_review else pd.DataFrame()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        comparison_df.to_excel(writer, sheet_name="Scenario Comparison", index=False)
+        details_df.to_excel(writer, sheet_name="Scenario Details", index=False)
+        if not review_df.empty:
+            review_df.to_excel(writer, sheet_name="AI Review", index=False)
+        for scenario in scenarios:
+            cashflow_df = cashflow_dataframe(scenario["result"])
+            if not cashflow_df.empty:
+                sheet_name = excel_sheet_name(scenario["name"])[:20]
+                cashflow_df.to_excel(writer, sheet_name=f"{sheet_name} Cashflow", index=False)
+
+    filename = f"{datetime.now().strftime('%Y.%m.%d - %H.%M')} - Scenario Comparison.xlsx"
+    return filename, output.getvalue()
+
+
+def excel_sheet_name(name):
+    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", " ", str(name)).strip()
+    return (cleaned or "Scenario")[:25]
+
+
+def scenario_financial_chart(comparison_df):
+    chart_data = comparison_df.melt(
+        id_vars=["Scenario"],
+        value_vars=["Investment (M OMR)", "Revenue (M OMR)"],
+        var_name="Metric",
+        value_name="Value",
+    )
+    return (
+        alt.Chart(chart_data)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("Scenario:N", sort=None, title=None),
+            y=alt.Y("Value:Q", title="M OMR"),
+            color=alt.Color("Metric:N", title=None),
+            xOffset="Metric:N",
+            tooltip=[
+                alt.Tooltip("Scenario:N"),
+                alt.Tooltip("Metric:N"),
+                alt.Tooltip("Value:Q", format=".1f"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+
+def scenario_yield_chart(comparison_df):
+    chart_data = comparison_df.melt(
+        id_vars=["Scenario"],
+        value_vars=["GFA (k sqm)", "BUA (k sqm)"],
+        var_name="Metric",
+        value_name="Value",
+    )
+    return (
+        alt.Chart(chart_data)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("Scenario:N", sort=None, title=None),
+            y=alt.Y("Value:Q", title="k sqm"),
+            color=alt.Color("Metric:N", title=None),
+            xOffset="Metric:N",
+            tooltip=[
+                alt.Tooltip("Scenario:N"),
+                alt.Tooltip("Metric:N"),
+                alt.Tooltip("Value:Q", format=".1f"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+
+def scenario_profit_chart(comparison_df):
+    return (
+        alt.Chart(comparison_df)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("Scenario:N", sort=None, title=None),
+            y=alt.Y("Profit Margin:Q", title="Profit Margin", axis=alt.Axis(format="%")),
+            color=alt.value("#fb4b4b"),
+            tooltip=[
+                alt.Tooltip("Scenario:N"),
+                alt.Tooltip("Profit Margin:Q", format=".1%"),
+            ],
+        )
+        .properties(height=220)
+    )
+
+
+def scenario_allocation_donut(scenario):
+    result = scenario["result"]
+    chart_data = pd.DataFrame(
+        {
+            "Typology": ["Luxury Villas", "Semi-detached Villas", "Apartments", "Business Center"],
+            "Allocation": [
+                result.get("allocation_luxury", 0),
+                result.get("allocation_semi", 0),
+                result.get("allocation_apartments", 0),
+                result.get("allocation_mixed", 0),
+            ],
+        }
+    )
+    return (
+        alt.Chart(chart_data)
+        .mark_arc(innerRadius=58, outerRadius=105)
+        .encode(
+            theta=alt.Theta("Allocation:Q"),
+            color=alt.Color("Typology:N", title=None),
+            tooltip=[
+                alt.Tooltip("Typology:N"),
+                alt.Tooltip("Allocation:Q", format=".1%"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+
+def cashflow_dataframe(result):
+    return pd.DataFrame(result.get("cashflow_monthly", []))
+
+
+def cashflow_chart(result):
+    cashflow_df = cashflow_dataframe(result)
+    if cashflow_df.empty:
+        return None
+
+    chart_df = cashflow_df.copy()
+    chart_df["Construction Cost"] = -chart_df["Construction Cost"].abs() / 1_000_000
+    chart_df["Revenue"] = chart_df["Revenue"] / 1_000_000
+    chart_df["Net Cashflow"] = chart_df["Net Cashflow"] / 1_000_000
+    chart_df["Cumulative Cashflow"] = chart_df["Cumulative Cashflow"] / 1_000_000
+
+    monthly_df = chart_df.melt(
+        id_vars=["Month"],
+        value_vars=["Construction Cost", "Revenue"],
+        var_name="Metric",
+        value_name="Value M OMR",
+    )
+
+    monthly_bars = (
+        alt.Chart(monthly_df)
+        .mark_bar(opacity=0.75)
+        .encode(
+            x=alt.X("Month:Q", title="Month", axis=alt.Axis(tickCount=12, labelAngle=0)),
+            y=alt.Y("Value M OMR:Q", title="Monthly cashflow (M OMR)"),
+            color=alt.Color(
+                "Metric:N",
+                title=None,
+                legend=alt.Legend(orient="bottom", direction="horizontal"),
+                scale=alt.Scale(
+                    domain=["Revenue", "Construction Cost"],
+                    range=["#ef4444", "#3b82c6"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("Month:Q", format=".0f"),
+                alt.Tooltip("Metric:N"),
+                alt.Tooltip("Value M OMR:Q", title="Value (M OMR)", format=",.2f"),
+            ],
+        )
+    )
+
+    net_line = (
+        alt.Chart(chart_df)
+        .mark_line(color="#111827", strokeWidth=2)
+        .encode(
+            x=alt.X("Month:Q", title="Month", axis=alt.Axis(tickCount=12, labelAngle=0)),
+            y=alt.Y("Net Cashflow:Q", title="Monthly cashflow (M OMR)"),
+            tooltip=[
+                alt.Tooltip("Month:Q", format=".0f"),
+                alt.Tooltip("Net Cashflow:Q", title="Net cashflow (M OMR)", format=",.2f"),
+            ],
+        )
+    )
+
+    zero_rule = alt.Chart(pd.DataFrame({"Value M OMR": [0]})).mark_rule(color="#9ca3af").encode(y="Value M OMR:Q")
+    monthly_layer = alt.layer(monthly_bars, net_line, zero_rule)
+
+    cumulative_line = (
+        alt.Chart(chart_df)
+        .mark_line(color="#22c55e", strokeWidth=3)
+        .encode(
+            x=alt.X("Month:Q", title="Month", axis=alt.Axis(tickCount=12, labelAngle=0)),
+            y=alt.Y(
+                "Cumulative Cashflow:Q",
+                title="Cumulative cash position (M OMR)",
+                axis=alt.Axis(orient="right"),
+            ),
+            tooltip=[
+                alt.Tooltip("Month:Q", format=".0f"),
+                alt.Tooltip("Cumulative Cashflow:Q", title="Cumulative (M OMR)", format=",.2f"),
+            ],
+        )
+    )
+
+    return (
+        alt.layer(monthly_layer, cumulative_line)
+        .resolve_scale(y="independent")
+        .properties(
+            height=330,
+            width="container",
+            title="Project Cashflow: bars show monthly revenue/cost, dark line is monthly net, green line is cumulative cash position",
+        )
+        .configure_view(strokeWidth=0)
+    )
+
+
+def scenario_completion_chart(comparison_df):
+    return (
+        alt.Chart(comparison_df)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("Scenario:N", sort=None, title=None),
+            y=alt.Y("Total Duration (months):Q", title="Months"),
+            color=alt.value("#60a5fa"),
+            tooltip=[
+                alt.Tooltip("Scenario:N"),
+                alt.Tooltip("Total Duration (months):Q", format=".0f"),
+                alt.Tooltip("Peak Funding Gap (M OMR):Q", format=".1f"),
+            ],
+        )
+        .properties(height=220)
+    )
+
+
+def format_ai_review_html(text):
+    formatted_lines = []
+    in_recommendation = False
+    for raw_line in text.splitlines():
+        line = html.escape(raw_line.strip())
+        if not line:
+            formatted_lines.append("<div style='height:8px;'></div>")
+        elif line.lower() in ("recommendation", "final recommendation"):
+            if not in_recommendation:
+                formatted_lines.append("<div class='ai-recommendation-panel'>")
+                in_recommendation = True
+            formatted_lines.append(f"<h4 style='margin:0 0 10px;'>Recommendation</h4>")
+        elif line.startswith("#"):
+            formatted_lines.append(f"<h4 style='margin:10px 0 6px;'>{line.lstrip('# ').strip()}</h4>")
+        elif line.startswith("- ") or line.startswith("* "):
+            formatted_lines.append(f"<div style='margin:4px 0 4px 14px;'>• {line[2:]}</div>")
+        elif re.match(r"^\d+\.", line):
+            formatted_lines.append(f"<div style='font-weight:800;margin:12px 0 6px;'>{line}</div>")
+        else:
+            formatted_lines.append(f"<div style='margin:4px 0 8px;'>{line}</div>")
+    if in_recommendation:
+        formatted_lines.append("</div>")
+    return "\n".join(formatted_lines)
+
+
+def generate_scenario_ai_review(scenarios):
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+    scenario_payload = []
+    for scenario in scenarios:
+        result = scenario["result"]
+        inputs = scenario["inputs"]
+        scenario_payload.append(
+            {
+                "name": scenario["name"],
+                "investment_m_omr": round(result.get("capex_total", 0) / 1_000_000, 2),
+                "revenue_m_omr": round(result.get("revenue_total", 0) / 1_000_000, 2),
+                "profit_margin": round(result.get("profit_general", 0), 4),
+                "total_duration_months": result.get("total_duration_months", result.get("estimated_completion_months", 0)),
+                "peak_funding_gap_m_omr": round(result.get("peak_funding_gap", 0) / 1_000_000, 2),
+                "gfa_k_sqm": round(result.get("gfa_total", 0) / 1000, 2),
+                "bua_k_sqm": round(result.get("builtup_total", 0) / 1000, 2),
+                "luxury_villas": round(result.get("luxury_units", 0)),
+                "semi_villas": round(result.get("semi_units", 0)),
+                "apartment_units": round(result.get("apartments_total_units", 0)),
+                "commercial_units": round(result.get("mixed_commercial_units", 0)),
+                "office_units": round(result.get("mixed_Office_units", 0)),
+                "apartment_parking_stories": inputs.get("apt_parking_stories", 0),
+                "business_parking_stories": inputs.get("mixed_parking_stories", 0),
+                "strategy": scenario["strategy"],
+            }
+        )
+
+    prompt = f"""
+You are a senior real estate master planning advisor.
+
+Compare these masterplan scenarios and provide a concise executive assessment.
+Focus on investment requirement, revenue, profit margin, development yield, unit mix, parking assumptions, total duration, peak funding gap, and market/sales risk.
+Use plain text with short numbered scenario headings and hyphen bullet points.
+
+For each scenario:
+- give 2-3 pros
+- give 2-3 cons or risks
+
+Then recommend one scenario and explain why.
+If two scenarios are close, say so and explain the trade-off.
+
+Scenarios:
+{json.dumps(scenario_payload, indent=2)}
+"""
+
+    response = client.responses.create(
+        model="gpt-5.5",
+        input=prompt,
+    )
+    return response.output_text
 
 
 
@@ -1169,6 +1835,7 @@ page = st.session_state.page
 main_content, right_panel = st.columns([3, 1], gap="large")
 with main_content:
 
+    st.caption("Engineering Department")
     st.title("AI Master Planning Optimization Agent")
     st.caption("Decision-support platform for land-use allocation, development yield, investment requirement, revenue, and profitability.")
 
@@ -1326,6 +1993,107 @@ with main_content:
                 value=safe_number(st.session_state.soft_cost_pct),
                 step=0.5,
                 key="input_soft_cost_pct",
+            )
+
+        st.divider()
+
+        st.markdown("### Delivery and Absorption Assumptions")
+        st.caption("Construction pace is in built-up sqm/month. Sales and leasing absorption is in units/month.")
+        delivery_cols = st.columns(5)
+        with delivery_cols[0]:
+            st.markdown('<div class="delivery-input-label">Luxury Construction<br>Pace<br><span>(sqm/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.construction_pace_luxury = st.number_input(
+                " ",
+                min_value=1.0,
+                value=safe_number(st.session_state.construction_pace_luxury),
+                step=10.0,
+                key="input_construction_pace_luxury",
+                label_visibility="collapsed",
+            )
+            st.markdown('<div class="delivery-input-label">Luxury Sales<br>Absorption<br><span>(units/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.absorption_luxury_per_month = st.number_input(
+                " ",
+                min_value=0.1,
+                value=safe_number(st.session_state.absorption_luxury_per_month),
+                step=1.0,
+                key="input_absorption_luxury_per_month",
+                label_visibility="collapsed",
+            )
+        with delivery_cols[1]:
+            st.markdown('<div class="delivery-input-label">Semi Construction<br>Pace<br><span>(sqm/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.construction_pace_semi = st.number_input(
+                " ",
+                min_value=1.0,
+                value=safe_number(st.session_state.construction_pace_semi),
+                step=10.0,
+                key="input_construction_pace_semi",
+                label_visibility="collapsed",
+            )
+            st.markdown('<div class="delivery-input-label">Semi Sales<br>Absorption<br><span>(units/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.absorption_semi_per_month = st.number_input(
+                " ",
+                min_value=0.1,
+                value=safe_number(st.session_state.absorption_semi_per_month),
+                step=1.0,
+                key="input_absorption_semi_per_month",
+                label_visibility="collapsed",
+            )
+        with delivery_cols[2]:
+            st.markdown('<div class="delivery-input-label">Apartment Construction<br>Pace<br><span>(sqm/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.construction_pace_apartment = st.number_input(
+                " ",
+                min_value=1.0,
+                value=safe_number(st.session_state.construction_pace_apartment),
+                step=50.0,
+                key="input_construction_pace_apartment",
+                label_visibility="collapsed",
+            )
+            st.markdown('<div class="delivery-input-label">Apartment Sales<br>Absorption<br><span>(units/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.absorption_apartment_per_month = st.number_input(
+                " ",
+                min_value=0.1,
+                value=safe_number(st.session_state.absorption_apartment_per_month),
+                step=1.0,
+                key="input_absorption_apartment_per_month",
+                label_visibility="collapsed",
+            )
+        with delivery_cols[3]:
+            st.markdown('<div class="delivery-input-label">Business Construction<br>Pace<br><span>(sqm/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.construction_pace_mixed = st.number_input(
+                " ",
+                min_value=1.0,
+                value=safe_number(st.session_state.construction_pace_mixed),
+                step=50.0,
+                key="input_construction_pace_mixed",
+                label_visibility="collapsed",
+            )
+            st.markdown('<div class="delivery-input-label">Commercial Sales/Leasing<br>Absorption<br><span>(units/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.absorption_commercial_per_month = st.number_input(
+                " ",
+                min_value=0.1,
+                value=safe_number(st.session_state.absorption_commercial_per_month),
+                step=1.0,
+                key="input_absorption_commercial_per_month",
+                label_visibility="collapsed",
+            )
+        with delivery_cols[4]:
+            st.markdown('<div class="delivery-input-label">Infrastructure<br>Pace<br><span>(sqm/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.construction_pace_infrastructure = st.number_input(
+                " ",
+                min_value=1.0,
+                value=safe_number(st.session_state.construction_pace_infrastructure),
+                step=100.0,
+                key="input_construction_pace_infrastructure",
+                label_visibility="collapsed",
+            )
+            st.markdown('<div class="delivery-input-label">Office Sales/Leasing<br>Absorption<br><span>(units/month)</span></div>', unsafe_allow_html=True)
+            st.session_state.absorption_office_per_month = st.number_input(
+                " ",
+                min_value=0.1,
+                value=safe_number(st.session_state.absorption_office_per_month),
+                step=1.0,
+                key="input_absorption_office_per_month",
+                label_visibility="collapsed",
             )
 
         st.divider()
@@ -1515,8 +2283,9 @@ with main_content:
             st.info("No optimization has been run yet. Go to Dashboard and press Run Optimization.")
         else:
             st.markdown("## Project Performance")
+            st.markdown("### Financial Outcome")
 
-            left, k1, k2, k3, right = st.columns([0.4, 1, 1, 1, 0.4])
+            k1, k2, k3 = st.columns(3)
 
             k1.metric(
                 "Investment Required",
@@ -1533,7 +2302,29 @@ with main_content:
                 f"{result['profit_general']:.1%}"
             )
 
+            st.markdown("### Delivery Duration")
+            st.caption("Typology durations are driven by construction pace and sales/leasing absorption. Apartments start from month 4; business center starts 6 months after apartments.")
+            duration_values = result.get("typology_durations", {})
+            duration_cols = st.columns(3)
+            duration_cols[0].metric("Luxury Villas", f"{duration_values.get('Luxury Villas', 0):.0f} months")
+            duration_cols[1].metric("Semi-detached Villas", f"{duration_values.get('Semi-detached Villas', 0):.0f} months")
+            duration_cols[2].metric("Apartments", f"{duration_values.get('Apartments', 0):.0f} months")
+            duration_cols = st.columns(3)
+            duration_cols[0].metric("Business Center", f"{duration_values.get('Business Center', 0):.0f} months")
+            duration_cols[1].metric("Infrastructure", f"{duration_values.get('Infrastructure', 0):.0f} months")
+            duration_cols[2].metric("Total Duration", f"{result['total_duration_months']:.0f} months")
+
+            st.markdown("### Funding Requirement")
+            funding_cols = st.columns(3)
+            funding_cols[0].metric("Peak Funding Gap", f"OMR {result['peak_funding_gap']/1_000_000:.1f} M")
+
             st.divider()
+
+            st.markdown("## Project Cashflow")
+            st.caption("Values are shown in M OMR. Costs are negative outflows, revenue is positive inflow, the dark line is monthly net cashflow, and the green line is cumulative cash position.")
+            cashflow_visual = cashflow_chart(result)
+            if cashflow_visual is not None:
+                st.altair_chart(cashflow_visual, use_container_width=True)
 
             st.markdown("## Development Yield")
 
@@ -1569,11 +2360,6 @@ with main_content:
                 )
             except Exception as error:
                 st.error(f"Could not prepare the results file: {error}")
-
-        
-
-
-
 
             st.subheader("Development Mix")
             st.caption("Recommended land-use allocation and development yield by typology.")
@@ -1752,6 +2538,205 @@ with main_content:
                 for _, row in mixed_details.iterrows():
                     st.write(f"**{row['Output']}:** {fmt(row['Value'])}")
 
+    elif page == "Comparison":
+        st.markdown("## Scenario Comparison")
+
+        scenarios = st.session_state.scenarios
+        if not scenarios:
+            st.info("No scenarios saved yet. Run an optimization, open Optimization Results, then confirm the result as a scenario.")
+        else:
+            st.caption(f"{len(scenarios)} saved scenario(s) in this browser session.")
+
+            comparison_df = scenario_comparison_rows(scenarios)
+
+            best_profit = comparison_df.loc[comparison_df["Profit Margin"].idxmax()]
+            lowest_investment = comparison_df.loc[comparison_df["Investment (M OMR)"].idxmin()]
+            highest_revenue = comparison_df.loc[comparison_df["Revenue (M OMR)"].idxmax()]
+            fastest_completion = comparison_df.loc[comparison_df["Total Duration (months)"].idxmin()]
+            lowest_gap = comparison_df.loc[comparison_df["Peak Funding Gap (M OMR)"].idxmin()]
+
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                st.markdown(
+                    f"""
+                    <div class="comparison-card">
+                        <div class="comparison-card-title">Best Profit Margin</div>
+                        <div class="comparison-card-value">{best_profit['Profit Margin']:.1%}</div>
+                        <div class="advisor-muted">{best_profit['Scenario']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with s2:
+                st.markdown(
+                    f"""
+                    <div class="comparison-card">
+                        <div class="comparison-card-title">Lowest Investment</div>
+                        <div class="comparison-card-value">{lowest_investment['Investment (M OMR)']:.1f} M</div>
+                        <div class="advisor-muted">{lowest_investment['Scenario']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with s3:
+                st.markdown(
+                    f"""
+                    <div class="comparison-card">
+                        <div class="comparison-card-title">Highest Revenue</div>
+                        <div class="comparison-card-value">{highest_revenue['Revenue (M OMR)']:.1f} M</div>
+                        <div class="advisor-muted">{highest_revenue['Scenario']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            s4, s5 = st.columns(2)
+            with s4:
+                st.markdown(
+                    f"""
+                    <div class="comparison-card">
+                        <div class="comparison-card-title">Fastest Completion</div>
+                        <div class="comparison-card-value">{fastest_completion['Total Duration (months)']:.0f} months</div>
+                        <div class="advisor-muted">{fastest_completion['Scenario']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with s5:
+                st.markdown(
+                    f"""
+                    <div class="comparison-card">
+                        <div class="comparison-card-title">Lowest Funding Gap</div>
+                        <div class="comparison-card-value">{lowest_gap['Peak Funding Gap (M OMR)']:.1f} M</div>
+                        <div class="advisor-muted">{lowest_gap['Scenario']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("### Visual Comparison")
+            chart_left, chart_right = st.columns(2)
+            with chart_left:
+                st.markdown("#### Investment vs Revenue")
+                st.altair_chart(scenario_financial_chart(comparison_df), use_container_width=True)
+            with chart_right:
+                st.markdown("#### Development Yield")
+                st.altair_chart(scenario_yield_chart(comparison_df), use_container_width=True)
+
+            chart_left, chart_right = st.columns(2)
+            with chart_left:
+                st.markdown("#### Profit Margin")
+                st.altair_chart(scenario_profit_chart(comparison_df), use_container_width=True)
+            with chart_right:
+                st.markdown("#### Development Mix")
+                selected_scenario_name = st.selectbox(
+                    "Scenario",
+                    [scenario["name"] for scenario in scenarios],
+                    key="allocation_donut_scenario",
+                )
+                selected_scenario = next(
+                    scenario for scenario in scenarios if scenario["name"] == selected_scenario_name
+                )
+                st.altair_chart(scenario_allocation_donut(selected_scenario), use_container_width=True)
+
+            chart_left, chart_right = st.columns(2)
+            with chart_left:
+                st.markdown("#### Completion Time")
+                st.altair_chart(scenario_completion_chart(comparison_df), use_container_width=True)
+            with chart_right:
+                st.markdown("#### Selected Scenario Cashflow")
+                selected_cashflow_chart = cashflow_chart(selected_scenario["result"])
+                if selected_cashflow_chart is not None:
+                    st.altair_chart(selected_cashflow_chart, use_container_width=True)
+
+            st.markdown("### Scenario Metrics")
+            st.dataframe(
+                comparison_df.style.format({
+                    "Investment (M OMR)": "{:.1f}",
+                    "Revenue (M OMR)": "{:.1f}",
+                    "Profit Margin": "{:.1%}",
+                    "Total Duration (months)": "{:.0f}",
+                    "Peak Funding Gap (M OMR)": "{:.1f}",
+                    "Sellable Land Use": "{:.0%}",
+                    "GFA (k sqm)": "{:.1f}",
+                    "BUA (k sqm)": "{:.1f}",
+                    "Luxury Villas": "{:,.0f}",
+                    "Semi Villas": "{:,.0f}",
+                    "Apartment Buildings": "{:,.0f}",
+                    "Apartment Units": "{:,.0f}",
+                    "Commercial Units": "{:,.0f}",
+                    "Office Units": "{:,.0f}",
+                    "Apartment Parking Stories": "{:,.0f}",
+                    "Business Parking Stories": "{:,.0f}",
+                }),
+                use_container_width=True,
+            )
+
+            st.markdown("### Saved Scenario Details")
+            for index, scenario in enumerate(scenarios):
+                result = scenario["result"]
+                inputs = scenario["inputs"]
+                with st.expander(scenario["name"], expanded=False):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Investment Required", f"OMR {result.get('capex_total', 0)/1_000_000:.1f} M")
+                    c2.metric("Expected Revenue", f"OMR {result.get('revenue_total', 0)/1_000_000:.1f} M")
+                    c3.metric("Profit Margin", f"{result.get('profit_general', 0):.1%}")
+                    c1.metric("Total Duration", f"{result.get('total_duration_months', result.get('estimated_completion_months', 0)):.0f} months")
+                    c2.metric("Peak Funding Gap", f"OMR {result.get('peak_funding_gap', 0)/1_000_000:.1f} M")
+
+                    st.write(f"Apartment parking stories: {fmt(inputs.get('apt_parking_stories', 0))}")
+                    st.write(f"Business center parking stories: {fmt(inputs.get('mixed_parking_stories', 0))}")
+                    st.write(
+                        "Apartment unit mix: "
+                        f"1-BHK {inputs.get('apt_pct_1bhk', 0):.0%}, "
+                        f"2-BHK {inputs.get('apt_pct_2bhk', 0):.0%}, "
+                        f"3-BHK {inputs.get('apt_pct_3bhk', 0):.0%}, "
+                        f"4-BHK {inputs.get('apt_pct_4bhk', 0):.0%}"
+                    )
+                    st.write(f"Saved: {scenario['created_at']}")
+
+                    if st.button("Remove Scenario", key=f"remove_scenario_{index}", use_container_width=True):
+                        st.session_state.scenarios.pop(index)
+                        st.session_state.scenario_ai_review = ""
+                        st.rerun()
+
+            st.divider()
+            st.markdown("### AI Scenario Review")
+            if len(scenarios) < 2:
+                st.info("Save at least two scenarios to generate a meaningful AI comparison.")
+            else:
+                if st.button("Generate AI Scenario Review", use_container_width=True):
+                    try:
+                        with st.spinner("Reviewing scenarios..."):
+                            st.session_state.scenario_ai_review = generate_scenario_ai_review(scenarios)
+                    except Exception as error:
+                        st.error(f"AI scenario review failed: {error}")
+
+                if st.session_state.scenario_ai_review:
+                    st.markdown(
+                        f"""
+                        <div class="ai-review-panel">
+                        {format_ai_review_html(st.session_state.scenario_ai_review)}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            try:
+                comparison_filename, comparison_data = build_scenario_comparison_excel(
+                    scenarios,
+                    st.session_state.scenario_ai_review,
+                )
+                st.download_button(
+                    "Download Comparison Excel",
+                    data=comparison_data,
+                    file_name=comparison_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as error:
+                st.error(f"Could not prepare the comparison file: {error}")
+
     st.markdown('<hr class="advisor-divider">', unsafe_allow_html=True)
 
 
@@ -1782,7 +2767,32 @@ with right_panel:
     )
     st.markdown("### AI Project Advisor")
 
-   
+    result = st.session_state.result
+
+    if result is not None:
+        st.markdown("#### Scenario Builder")
+        st.caption("Save the current optimization as a scenario before changing assumptions.")
+        scenario_name = st.text_input(
+            "Scenario name",
+            value=f"Scenario {len(st.session_state.scenarios) + 1}",
+            key="scenario_name_input",
+        )
+        if st.button("Confirm as Scenario", use_container_width=True, type="primary"):
+            if not scenario_name.strip():
+                st.warning("Please enter a scenario name.")
+            else:
+                st.session_state.scenarios.append(create_scenario_snapshot(scenario_name))
+                st.session_state.scenario_ai_review = ""
+                st.success(f"Saved {scenario_name.strip()} for comparison.")
+
+        if st.session_state.scenarios:
+            st.caption(f"{len(st.session_state.scenarios)} scenario(s) saved.")
+            if st.button("Open Scenario Comparison", use_container_width=True):
+                st.session_state.page = "Comparison"
+                st.rerun()
+
+        st.markdown('<hr class="advisor-divider">', unsafe_allow_html=True)
+
     land_area_value = safe_number(
         st.session_state.get(
             "total_land_area",
@@ -1801,8 +2811,6 @@ with right_panel:
     )
 
     st.markdown('<hr class="advisor-divider">', unsafe_allow_html=True)
-
-    result = st.session_state.result
 
     if result is not None:
 
@@ -1831,6 +2839,17 @@ with right_panel:
             <div class="advisor-metric">
                 <div class="advisor-metric-label advisor-muted">Expected Profit Margin</div>
                 <div class="advisor-metric-value advisor-strong">{result['profit_general']:.1%}</div>
+            </div>
+            <hr class="advisor-divider">
+            <div class="advisor-metric">
+                <div class="advisor-metric-label advisor-muted">Total Duration</div>
+                <div class="advisor-metric-value advisor-strong">{result['total_duration_months']:.0f} months</div>
+                <div class="advisor-caption advisor-muted">Based on phased starts, construction pace, and absorption</div>
+            </div>
+            <hr class="advisor-divider">
+            <div class="advisor-metric">
+                <div class="advisor-metric-label advisor-muted">Peak Funding Gap</div>
+                <div class="advisor-metric-value advisor-strong">{result['peak_funding_gap']/1_000_000:.1f} M OMR</div>
             </div>
             <hr class="advisor-divider">
             """,
@@ -2008,4 +3027,4 @@ with right_panel:
 
 
 
-st.caption("AI Master Planning Optimization Agent | Version 1.0 | Engineering Department")
+st.caption("AI Master Planning Optimization Agent | Version 1.0")
