@@ -586,11 +586,26 @@ def save_current_inputs():
     data = collect_data()
     data["project_name"] = st.session_state.project_name
     data["location"] = st.session_state.location
+    st.session_state.defaults = data.copy()
     st.session_state.saved_inputs_session = data
+    try:
+        with open(SAVED_INPUTS_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception:
+        pass
 
 
 def load_saved_inputs():
-    return st.session_state.get("saved_inputs_session")
+    saved_inputs = st.session_state.get("saved_inputs_session")
+    if saved_inputs:
+        return saved_inputs
+    if SAVED_INPUTS_FILE.exists():
+        try:
+            with open(SAVED_INPUTS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 def apply_ai_suggestion(approach):
     if approach == "Balanced":
